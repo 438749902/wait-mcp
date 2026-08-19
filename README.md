@@ -129,21 +129,34 @@ direct_only_tool_namespaces = ["mcp__wait_mcp"]
 修改配置后重启 Codex。较长的 `tool_timeout_sec` 是运行数小时实验所必需的。<br>
 Restart Codex after changing the configuration. The long `tool_timeout_sec` is required for experiments that run for hours.
 
-### 可选的全局 nohup 守卫 / Optional global `nohup` guard
+### 安装全局 hook / Install the global hook
 
-若希望从机制上阻止 Codex 使用脱离式后台命令，可在 `%USERPROFILE%\\.codex\\config.toml` 追加以下当前 schema 支持的 hook；把路径替换为本机仓库中的 `wait_mcp_policy.py`。<br>
-To block detached background commands at the Codex layer, append this hook supported by the current schema to `%USERPROFILE%\\.codex\\config.toml`; replace the path with the local `wait_mcp_policy.py` path.
+当前 Codex schema 会从 `%USERPROFILE%\\.codex\\hooks.json` 或 `config.toml` 读取 hook。推荐使用独立的 `hooks.json`；把下面内容保存到该路径，并替换 Python 与脚本路径。<br>
+The current Codex schema loads hooks from `%USERPROFILE%\\.codex\\hooks.json` or `config.toml`. Prefer a separate `hooks.json`; save the following there and replace the Python and script paths.
 
-```toml
-[[hooks.PreToolUse]]
-matcher = "^Bash$"
-
-[[hooks.PreToolUse.hooks]]
-type = "command"
-command_windows = 'D:\\miniconda\\envs\\py311\\python.exe "C:\\path\\to\\wait-mcp\\wait_mcp_policy.py"'
-timeout = 5
-statusMessage = "Checking experiment launch policy"
+```json
+{
+  "description": "wait-mcp detached experiment launch guard",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^Bash$",
+        "hooks": [
+          {
+            "type": "command",
+            "command_windows": "D:/miniconda/envs/py311/python.exe C:/path/to/wait-mcp/wait_mcp_policy.py",
+            "timeout": 30,
+            "statusMessage": "Checking detached experiment launch"
+          }
+        ]
+      }
+    ]
+  }
+}
 ```
+
+重启 Codex 后打开 `/hooks`，review 并 trust 这个非托管 hook；否则它会出现在列表中但不会执行。<br>
+After restarting Codex, open `/hooks` and review and trust this non-managed hook; otherwise it may appear in the list but will not run.
 
 这只是安全护栏；真正的默认行为由 `run_and_wait`、MCP `instructions` 和全局 `AGENTS.md` 共同决定。修改全局配置后必须重启 Codex Desktop。<br>
 This is a guardrail; the default workflow comes from `run_and_wait`, MCP `instructions`, and global `AGENTS.md` together. Restart Codex Desktop after changing global configuration.
