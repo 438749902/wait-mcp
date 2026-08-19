@@ -117,7 +117,7 @@ run(command: string | string[], cwd?: string, env?: object, name?: string)
 wait(job_ids?: string[], mode?: "all" | "any")
 output(job_id: string, tail_lines?: integer, offset?: {stdout?: integer, stderr?: integer})
 kill(job_id: string, timeout_sec?: number)
-list(status?: "running" | "completed" | "failed" | "killed")
+list(status?: "running" | "completed" | "failed" | "killed", cwd?: string)
 ```
 
 `run` 会返回任务 ID、PID、状态、命令、工作目录和日志路径。<br>
@@ -196,4 +196,3 @@ This server executes local commands with the permissions of the MCP process. Onl
 
 MIT，详见 [LICENSE](LICENSE)。<br>
 MIT. See [LICENSE](LICENSE).
-
