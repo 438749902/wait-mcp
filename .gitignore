@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.test-home/
+.control-test-home/
+.acceptance-home/
+.acceptance-multi-home/
+.list-test-home/
+.tools/
+.gh-config/
+.gitconfig-global
+*.log
+.codex-wait-mcp/
