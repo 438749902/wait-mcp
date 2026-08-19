@@ -3,6 +3,28 @@
 面向 Windows、仅使用 Python 标准库的长时间本地 Shell 任务 MCP server。<br>
 Windows-first, stdlib-only MCP server for long-running local shell jobs.
 
+## 问题背景
+
+在原有的 Codex 执行路径中，长时间任务可能被处理成“查询—返回—再次查询”的循环；典型表现是大约每 30 秒重新查询一次任务状态。<br>
+In the original Codex execution path, long-running jobs could be handled as a “query, return, query again” loop; a typical symptom was another status query roughly every 30 seconds.
+
+对于运行数小时的训练或实验，这会产生大量无意义的中间模型调用，持续消耗 token，并把重复的任务状态、日志片段和工具结果堆积到上下文中。<br>
+For training runs or experiments lasting several hours, this creates many unnecessary intermediate model calls, consumes tokens continuously, and fills the context with repeated job states, log fragments, and tool results.
+
+这种 polling 还会让 LLM 被迫承担 scheduler 的职责：它需要反复确认任务是否完成，而不是在任务结束后一次性处理结果。<br>
+This polling also makes the LLM act as a scheduler: it repeatedly checks whether the job has finished instead of processing one final result when the job completes.
+
+## 解决方案
+
+`wait-mcp` 将等待移动到确定性的 MCP runtime 中：一次 `wait` 调用会在服务器内部真正阻塞，直到目标进程完成，然后一次性返回结果。<br>
+`wait-mcp` moves waiting into deterministic MCP runtime: one `wait` call blocks inside the server until the target process completes, then returns the result once.
+
+因此，长时间任务运行期间不会产生重复的 `wait` 调用、周期性“仍在运行”响应或中间模型采样。<br>
+As a result, long-running jobs produce no repeated `wait` calls, periodic “still running” responses, or intermediate model sampling while they are running.
+
+P0 目标是：长任务运行期间 0 次 polling、0 次重复 wait 调用、0 次中间模型采样；任务完成后，agent loop 再继续分析结果。<br>
+The P0 target is: zero polling, zero repeated wait calls, and zero intermediate model sampling while a long-running job executes; the agent loop resumes only after the job completes.
+
 ## 项目简介
 
 `wait-mcp` 用于运行 Python 训练、CUDA/PyTorch 实验和其他需要长时间执行的本地任务。
