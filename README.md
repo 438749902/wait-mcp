@@ -36,8 +36,8 @@ The core design is that `wait` blocks inside the MCP tool call until the real ch
 它不会返回“仍在运行”的中间结果，因此不需要模型进行周期性 polling 或重复采样。<br>
 It does not return intermediate “still running” results, so the model does not need periodic polling or repeated sampling.
 
-阻塞等待的设计方式参考了 Reasonix，但本项目是独立实现。<br>
-The blocking-wait design references the Reasonix approach, but this project is an independent implementation.
+本项目参考 Reasonix 的设计方式开发；核心 blocking-wait 思路并非本项目原创，感谢 Reasonix 提供设计参考。<br>
+This project was developed with reference to Reasonix's design. The core blocking-wait idea is not original to this project; Reasonix is credited as the design reference.
 
 > **核心原则**<br>
 > LLM 负责提出假设、启动实验、等待结果和解释结果；等待本身由确定性的运行时完成。<br>
@@ -46,10 +46,29 @@ The blocking-wait design references the Reasonix approach, but this project is a
 
 ## 功能
 
+### 推荐执行路径 / Recommended execution path
+
+单个长时间实验优先调用 `run_and_wait`：它在同一个 MCP tool call 中启动并等待到任务结束，Codex 不需要自己记住第二步，也不会自然退回 `nohup`。<br>
+For one long-running experiment, prefer `run_and_wait`: it starts and waits in one MCP tool call, so Codex does not have to remember a second step or fall back to `nohup`.
+
+只有明确需要并行运行多个实验时，才使用 `run`；返回 `job_id` 后下一步必须立即调用 `wait`，再进行其他分析或 shell 操作。<br>
+Use `run` only when explicit concurrency is needed; after it returns a `job_id`, the next action must be `wait` before other analysis or shell work.
+
+当前 Codex Desktop 仍允许模型直接调用普通 shell，因此提示词本身不能形成硬保证。本项目的 MCP server instructions 会把上述流程注入工具上下文；安装附带的 Codex hook 后，还可以拦截 `nohup`、`Start-Process` 等脱离式后台启动命令。<br>
+Current Codex Desktop still allows the model to call ordinary shell tools, so prompting alone is not a hard guarantee. This server injects the workflow through MCP server instructions; the optional Codex hook can additionally block detached launch commands such as `nohup` and `Start-Process`.
+
+仓库中的 `wait_mcp_policy.py` 是该 hook 的最小标准库实现；它只拦截脱离式后台启动，不拦截普通同步 shell 命令。<br>
+The repository's `wait_mcp_policy.py` is the minimal stdlib implementation of that hook; it blocks only detached background launches and does not block ordinary synchronous shell commands.
+
 ### `run`
 
 启动命令并立即返回持久化的 `job_id`。<br>
 Start a command and immediately return a durable `job_id`.
+
+### `run_and_wait`
+
+单个实验的推荐入口：启动命令后在 MCP 内部阻塞，直到完成再返回最终结果。<br>
+The recommended entry point for one experiment: start the command, block inside MCP, and return only the final result.
 
 ### `wait`
 
@@ -110,10 +129,43 @@ direct_only_tool_namespaces = ["mcp__wait_mcp"]
 修改配置后重启 Codex。较长的 `tool_timeout_sec` 是运行数小时实验所必需的。<br>
 Restart Codex after changing the configuration. The long `tool_timeout_sec` is required for experiments that run for hours.
 
+### 安装全局 hook / Install the global hook
+
+当前 Codex schema 会从 `%USERPROFILE%\\.codex\\hooks.json` 或 `config.toml` 读取 hook。推荐使用独立的 `hooks.json`；把下面内容保存到该路径，并替换 Python 与脚本路径。<br>
+The current Codex schema loads hooks from `%USERPROFILE%\\.codex\\hooks.json` or `config.toml`. Prefer a separate `hooks.json`; save the following there and replace the Python and script paths.
+
+```json
+{
+  "description": "wait-mcp detached experiment launch guard",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "^Bash$",
+        "hooks": [
+          {
+            "type": "command",
+            "command_windows": "D:/miniconda/envs/py311/python.exe C:/path/to/wait-mcp/wait_mcp_policy.py",
+            "timeout": 30,
+            "statusMessage": "Checking detached experiment launch"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+重启 Codex 后打开 `/hooks`，review 并 trust 这个非托管 hook；否则它会出现在列表中但不会执行。<br>
+After restarting Codex, open `/hooks` and review and trust this non-managed hook; otherwise it may appear in the list but will not run.
+
+这只是安全护栏；真正的默认行为由 `run_and_wait`、MCP `instructions` 和全局 `AGENTS.md` 共同决定。修改全局配置后必须重启 Codex Desktop。<br>
+This is a guardrail; the default workflow comes from `run_and_wait`, MCP `instructions`, and global `AGENTS.md` together. Restart Codex Desktop after changing global configuration.
+
 ## 工具 schema
 
 ```text
 run(command: string | string[], cwd?: string, env?: object, name?: string)
+run_and_wait(command: string | string[], cwd?: string, env?: object, name?: string)
 wait(job_ids?: string[], mode?: "all" | "any")
 output(job_id: string, tail_lines?: integer, offset?: {stdout?: integer, stderr?: integer})
 kill(job_id: string, timeout_sec?: number)
@@ -125,6 +177,12 @@ list(status?: "running" | "completed" | "failed" | "killed", cwd?: string)
 
 `wait` 会返回退出码、耗时、有限日志尾部和日志路径，绝不会返回 polling 状态。<br>
 `wait` returns the exit code, duration, bounded log tails, and log paths; it never returns a polling status.
+
+`run_and_wait` 返回单个完成任务对象；`run` 仍返回单个 `job_id`，用于随后显式的 `wait` 或多个任务的 `any/all` 等待。<br>
+`run_and_wait` returns one completed job object; `run` still returns one `job_id` for explicit `wait` or multi-job `any/all` waits.
+
+通过 MCP 调用启动的脱离式命令会被拒绝；直接 shell 调用不经过本 server，必须由 Codex hook 或全局规则另行拦截。<br>
+Detached commands launched through MCP are rejected; direct shell calls bypass this server and require a separate Codex hook or global rule.
 
 服务器会并发处理 MCP 请求，因此一个 `wait` 阻塞时仍可处理 `kill`、`output` 和 `list`。<br>
 The server processes MCP requests concurrently, so `kill`, `output`, and `list` can be handled while another `wait` is blocked.

@@ -25,7 +25,12 @@ def call(proc, request_id, name, arguments):
 def main():
     shutil.rmtree(HOME, ignore_errors=True)
     proc = subprocess.Popen([sys.executable, str(ROOT / "wait_mcp.py")], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env={**os.environ, "WAIT_MCP_HOME": str(HOME)})
-    send(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+    initialized = send(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+    assert "run_and_wait" in initialized["result"]["instructions"]
+    tools = send(proc, {"jsonrpc": "2.0", "id": 1.5, "method": "tools/list"})
+    assert "run_and_wait" in {tool["name"] for tool in tools["result"]["tools"]}
+    blocked = send(proc, {"jsonrpc": "2.0", "id": 1.75, "method": "tools/call", "params": {"name": "run", "arguments": {"command": "nohup python train.py"}}})
+    assert "detached experiment launch" in blocked["error"]["message"]
     one = call(proc, 2, "run", {"command": [sys.executable, str(ROOT / "dummy_experiment.py"), "2"], "name": "two-second"})
     assert one["status"] == "running"
     current = call(proc, 3, "output", {"job_id": one["job_id"], "tail_lines": 1})
@@ -34,11 +39,13 @@ def main():
     done = call(proc, 4, "wait", {"job_ids": [one["job_id"]]})
     assert done[0]["status"] == "completed" and done[0]["exit_code"] == 0
     assert time.monotonic() - started >= 1.0
-    two = call(proc, 5, "run", {"command": [sys.executable, str(ROOT / "dummy_experiment.py"), "10"]})
-    killed = call(proc, 6, "kill", {"job_id": two["job_id"]})
+    blocking = call(proc, 5, "run_and_wait", {"command": [sys.executable, str(ROOT / "dummy_experiment.py"), "1"]})
+    assert blocking["status"] == "completed" and blocking["exit_code"] == 0
+    two = call(proc, 6, "run", {"command": [sys.executable, str(ROOT / "dummy_experiment.py"), "10"]})
+    killed = call(proc, 7, "kill", {"job_id": two["job_id"]})
     assert killed["status"] in ("killed", "running")
-    listed = call(proc, 7, "list", {})
-    assert {j["job_id"] for j in listed} >= {one["job_id"], two["job_id"]}
+    listed = call(proc, 8, "list", {})
+    assert {j["job_id"] for j in listed} >= {one["job_id"], two["job_id"], blocking["job_id"]}
     proc.terminate(); proc.wait(timeout=5)
     print("self-test passed")
 

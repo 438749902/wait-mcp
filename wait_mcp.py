@@ -6,6 +6,7 @@ from __future__ import annotations
 import ctypes
 import json
 import os
+import re
 import signal
 import sqlite3
 import subprocess
@@ -22,6 +23,17 @@ LOGS = HOME / "logs"
 DB_PATH = HOME / "jobs.sqlite"
 TAIL_LINES = 20
 MAX_OUTPUT_BYTES = 1024 * 1024
+SERVER_INSTRUCTIONS = (
+    "For any long-running training or experiment, call run_and_wait instead of shell. "
+    "It starts the job and blocks until completion in this MCP call. Use run only for "
+    "explicit concurrency, then call wait immediately before doing other work. Never "
+    "launch experiments with nohup, shell background &, Start-Process, or detached "
+    "redirection."
+)
+DETACHED_COMMAND = re.compile(
+    r"\b(?:nohup|start\s+/b|start-process|start-job)\b|(?<!&)\s&\s*(?:$|2?>)",
+    re.IGNORECASE,
+)
 
 
 class RequestCancelled(Exception):
@@ -84,10 +96,15 @@ def recovered_exit_code(pid: int) -> int | None:
     return int(code.value) if ok else None
 
 
+COMMAND_SCHEMA = {"description": "Shell command string or argv array.", "oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]}
+COMMON_RUN_PROPERTIES = {"command": COMMAND_SCHEMA, "cwd": {"type": "string"}, "env": {"type": "object", "additionalProperties": {"type": "string"}}, "name": {"type": "string"}}
+
+
 TOOLS = [
-    {"name": "run", "description": "Start a shell job and return immediately with a durable job_id.", "inputSchema": {"type": "object", "required": ["command"], "properties": {"command": {"description": "Shell command string or argv array.", "oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]}, "cwd": {"type": "string"}, "env": {"type": "object", "additionalProperties": {"type": "string"}}, "name": {"type": "string"}}}},
-    {"name": "wait", "description": "Block inside the MCP call until one or all target jobs finish. Never polls the caller. Supports MCP request cancellation.", "inputSchema": {"type": "object", "properties": {"job_ids": {"type": "array", "items": {"type": "string"}}, "mode": {"type": "string", "enum": ["all", "any"], "default": "all"}}}},
-    {"name": "output", "description": "Read current output without waiting for completion.", "inputSchema": {"type": "object", "required": ["job_id"], "properties": {"job_id": {"type": "string"}, "tail_lines": {"type": "integer", "minimum": 1}, "offset": {"type": "object", "properties": {"stdout": {"type": "integer", "minimum": 0}, "stderr": {"type": "integer", "minimum": 0}}}}}},
+    {"name": "run_and_wait", "description": "Preferred path for one long-running experiment: start the job and block in this MCP call until it completes. Use instead of run unless explicit concurrency is requested.", "inputSchema": {"type": "object", "required": ["command"], "properties": COMMON_RUN_PROPERTIES}},
+    {"name": "run", "description": "Start a shell job and return immediately with a durable job_id. Use only when you need concurrent jobs; call wait immediately after run before doing other work.", "inputSchema": {"type": "object", "required": ["command"], "properties": COMMON_RUN_PROPERTIES}},
+    {"name": "wait", "description": "Block inside the MCP call until one or all target jobs finish. Never polls the caller. After run, this should be the next tool call. Supports MCP request cancellation.", "inputSchema": {"type": "object", "properties": {"job_ids": {"type": "array", "items": {"type": "string"}}, "mode": {"type": "string", "enum": ["all", "any"], "default": "all"}}}},
+    {"name": "output", "description": "Read current output without waiting for completion. Do not use it as a polling substitute for wait.", "inputSchema": {"type": "object", "required": ["job_id"], "properties": {"job_id": {"type": "string"}, "tail_lines": {"type": "integer", "minimum": 1}, "offset": {"type": "object", "properties": {"stdout": {"type": "integer", "minimum": 0}, "stderr": {"type": "integer", "minimum": 0}}}}}},
     {"name": "kill", "description": "Gracefully terminate a job, then kill its process tree after a short timeout.", "inputSchema": {"type": "object", "required": ["job_id"], "properties": {"job_id": {"type": "string"}, "timeout_sec": {"type": "number", "minimum": 0, "default": 5}}}},
     {"name": "list", "description": "List durable jobs by status, optionally filtered by working directory.", "inputSchema": {"type": "object", "properties": {"status": {"type": "string", "enum": ["running", "completed", "failed", "killed"]}, "cwd": {"type": "string", "description": "Only return jobs whose normalized working directory matches this path."}}}},
 ]
@@ -170,6 +187,9 @@ class JobStore:
         command = args.get("command")
         if not isinstance(command, (str, list)) or (isinstance(command, list) and not all(isinstance(x, str) for x in command)):
             raise ValueError("command must be a string or string array")
+        command_text = command if isinstance(command, str) else " ".join(command)
+        if DETACHED_COMMAND.search(command_text):
+            raise ValueError("detached experiment launch is not supported; use run_and_wait or run followed by wait")
         cwd = str(Path(args.get("cwd") or os.getcwd()).expanduser().resolve())
         if not Path(cwd).is_dir():
             raise ValueError(f"cwd does not exist: {cwd}")
@@ -313,6 +333,9 @@ class JobStore:
 
 
 def call(store: JobStore, name: str, args: dict[str, Any], cancelled: threading.Event | None = None) -> Any:
+    if name == "run_and_wait":
+        started = store.run(args)
+        return store.wait([started["job_id"]], "all", cancelled)[0]
     if name == "run": return store.run(args)
     if name == "wait": return store.wait(args.get("job_ids"), args.get("mode", "all"), cancelled)
     if name == "output": return store.output(args)
@@ -336,7 +359,7 @@ def main() -> None:
         try:
             method = request.get("method")
             if method == "initialize":
-                result = {"protocolVersion": request.get("params", {}).get("protocolVersion", "2025-03-26"), "capabilities": {"tools": {}}, "serverInfo": {"name": "wait-mcp", "version": "0.2.0"}}
+                result = {"protocolVersion": request.get("params", {}).get("protocolVersion", "2025-03-26"), "capabilities": {"tools": {}}, "serverInfo": {"name": "wait-mcp", "version": "0.3.0"}, "instructions": SERVER_INSTRUCTIONS}
             elif method == "tools/list":
                 result = {"tools": TOOLS}
             elif method == "tools/call":
