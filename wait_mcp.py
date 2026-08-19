@@ -89,7 +89,7 @@ TOOLS = [
     {"name": "wait", "description": "Block inside the MCP call until one or all target jobs finish. Never polls the caller. Supports MCP request cancellation.", "inputSchema": {"type": "object", "properties": {"job_ids": {"type": "array", "items": {"type": "string"}}, "mode": {"type": "string", "enum": ["all", "any"], "default": "all"}}}},
     {"name": "output", "description": "Read current output without waiting for completion.", "inputSchema": {"type": "object", "required": ["job_id"], "properties": {"job_id": {"type": "string"}, "tail_lines": {"type": "integer", "minimum": 1}, "offset": {"type": "object", "properties": {"stdout": {"type": "integer", "minimum": 0}, "stderr": {"type": "integer", "minimum": 0}}}}}},
     {"name": "kill", "description": "Gracefully terminate a job, then kill its process tree after a short timeout.", "inputSchema": {"type": "object", "required": ["job_id"], "properties": {"job_id": {"type": "string"}, "timeout_sec": {"type": "number", "minimum": 0, "default": 5}}}},
-    {"name": "list", "description": "List durable jobs by status.", "inputSchema": {"type": "object", "properties": {"status": {"type": "string", "enum": ["running", "completed", "failed", "killed"]}}}},
+    {"name": "list", "description": "List durable jobs by status, optionally filtered by working directory.", "inputSchema": {"type": "object", "properties": {"status": {"type": "string", "enum": ["running", "completed", "failed", "killed"]}, "cwd": {"type": "string", "description": "Only return jobs whose normalized working directory matches this path."}}}},
 ]
 
 
@@ -124,11 +124,17 @@ class JobStore:
                 VALUES (:job_id,:name,:command,:cwd,:pid,:start_time,:end_time,:status,:exit_code,:stdout_path,:stderr_path)""", job)
             self.db.commit()
 
-    def jobs_for(self, status: str | None = None) -> list[dict[str, Any]]:
+    def jobs_for(self, status: str | None = None, cwd: str | None = None) -> list[dict[str, Any]]:
         with self.lock:
             query = "SELECT * FROM jobs" + (" WHERE status=?" if status else "") + " ORDER BY start_time"
             rows = self.db.execute(query, ((status,) if status else ())).fetchall()
-        return [dict(r) for r in rows]
+        jobs = [dict(r) for r in rows]
+        if cwd is None:
+            return jobs
+        if not isinstance(cwd, str):
+            raise ValueError("cwd must be a string")
+        wanted = os.path.normcase(os.path.normpath(str(Path(cwd).expanduser().resolve())))
+        return [j for j in jobs if os.path.normcase(os.path.normpath(j["cwd"])) == wanted]
 
     def recover(self) -> None:
         for job in self.jobs_for("running"):
@@ -311,7 +317,7 @@ def call(store: JobStore, name: str, args: dict[str, Any], cancelled: threading.
     if name == "wait": return store.wait(args.get("job_ids"), args.get("mode", "all"), cancelled)
     if name == "output": return store.output(args)
     if name == "kill": return store.kill(args)
-    if name == "list": return [store.public(j) for j in store.jobs_for(args.get("status"))]
+    if name == "list": return [store.public(j) for j in store.jobs_for(args.get("status"), args.get("cwd"))]
     raise ValueError(f"unknown tool: {name}")
 
 
@@ -371,3 +377,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
