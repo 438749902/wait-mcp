@@ -254,3 +254,15 @@ This server executes local commands with the permissions of the MCP process. Onl
 
 MIT，详见 [LICENSE](LICENSE)。<br>
 MIT. See [LICENSE](LICENSE).
+
+## Adaptive experiment timing
+
+Pass `progress` for experiments that report progress, for example:
+
+```json
+{"total_steps": 500, "sample_steps": 10}
+```
+
+The server samples the flushed stdout progress, estimates average step time and total duration, checks at the predicted finish time, and terminates the job at a bounded hard deadline. The default pattern recognizes `step`, `epoch`, `round`, `iteration`, and `iter` output such as `step=10/500`; `total_steps` may be omitted when the output contains `/total`.
+
+The result exposes `progress.estimated_duration_sec`, `progress.avg_step_sec`, `progress.checkpoint_at`, and `progress.hard_deadline`. A bounded overrun returns `timed_out` instead of waiting indefinitely.

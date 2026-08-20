@@ -29,7 +29,7 @@ def main():
     events.append({"kind": "initialize", "sent": started, "received": ended, "response": response})
     response, started, ended = send(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
     names = [tool["name"] for tool in response["result"]["tools"]]
-    assert names == ["run", "wait", "output", "kill", "list"], names
+    assert names == ["run_and_wait", "run", "wait", "output", "kill", "list"], names
     events.append({"kind": "tools/list", "sent": started, "received": ended, "tool_names": names})
     response, started, ended = send(proc, {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "run", "arguments": {"command": [sys.executable, str(ROOT / "dummy_experiment.py"), "120"], "name": "dummy-120"}}})
     job = json.loads(response["result"]["content"][0]["text"])
