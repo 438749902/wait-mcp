@@ -164,8 +164,8 @@ This is a guardrail; the default workflow comes from `run_and_wait`, MCP `instru
 ## 工具 schema
 
 ```text
-run(command: string | string[], cwd?: string, env?: object, name?: string)
-run_and_wait(command: string | string[], cwd?: string, env?: object, name?: string)
+run(command: string | string[], cwd?: string, env?: object, name?: string, nohup_hours?: number)
+run_and_wait(command: string | string[], cwd?: string, env?: object, name?: string, nohup_hours?: number)
 wait(job_ids?: string[], mode?: "all" | "any")
 output(job_id: string, tail_lines?: integer, offset?: {stdout?: integer, stderr?: integer})
 kill(job_id: string, timeout_sec?: number)
@@ -178,8 +178,8 @@ list(status?: "running" | "completed" | "failed" | "killed", cwd?: string)
 `wait` 会返回退出码、耗时、有限日志尾部和日志路径，绝不会返回 polling 状态。<br>
 `wait` returns the exit code, duration, bounded log tails, and log paths; it never returns a polling status.
 
-`run_and_wait` 返回单个完成任务对象；`run` 仍返回单个 `job_id`，用于随后显式的 `wait` 或多个任务的 `any/all` 等待。<br>
-`run_and_wait` returns one completed job object; `run` still returns one `job_id` for explicit `wait` or multi-job `any/all` waits.
+`run_and_wait` 通常返回完成任务对象；如果预计时长超过 `nohup_hours`（默认 3 小时），则返回 `status: "nohup"`、预计完成时间和下次建议查询时间，任务继续在脱离式进程组中运行。<br>
+`run_and_wait` normally returns one completed job object. If the estimate exceeds `nohup_hours` (default 3 hours), it returns `status: "nohup"` with an estimated completion time and next query time while the detached job continues running.
 
 通过 MCP 调用启动的脱离式命令会被拒绝；直接 shell 调用不经过本 server，必须由 Codex hook 或全局规则另行拦截。<br>
 Detached commands launched through MCP are rejected; direct shell calls bypass this server and require a separate Codex hook or global rule.
@@ -254,3 +254,15 @@ This server executes local commands with the permissions of the MCP process. Onl
 
 MIT，详见 [LICENSE](LICENSE)。<br>
 MIT. See [LICENSE](LICENSE).
+
+## Adaptive experiment timing
+
+Pass `progress` for experiments that report progress, for example:
+
+```json
+{"total_steps": 500, "sample_steps": 10}
+```
+
+The server samples the flushed stdout progress, estimates average step time and total duration, and checks output at the predicted finish time. It never terminates a healthy job merely because the estimate was exceeded: it returns `review_required` with stdout/stderr diagnostics, and the caller can resume with `wait` or terminate with `kill` after confirming a failure. The default pattern recognizes `step`, `epoch`, `round`, `iteration`, and `iter` output such as `step=10/500`; `total_steps` may be omitted when the output contains `/total`.
+
+The result exposes `progress.estimated_duration_sec`, `progress.avg_step_sec`, `progress.checkpoint_at`, and `review.fatal_signals`. A slow but healthy run remains alive; only an explicit `kill` or a real process exit ends it. Long jobs also return `nohup.estimated_completion_at` and `nohup.next_query_at`.
