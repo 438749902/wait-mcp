@@ -58,17 +58,28 @@ def main():
         assert recovered["status"] == "completed", recovered
         assert recovered["progress"]["current_step"] == 6, recovered
 
-        reviewed = call(proc, 2, "run_and_wait", {
+        detached = call(proc, 4, "run_and_wait", {
+            "command": [sys.executable, str(ROOT / "dummy_experiment.py"), "6"],
+            "nohup_hours": 0.0001,
+            "progress": {"sample_steps": 2, "sample_timeout_sec": 2, "review_interval_sec": 1},
+        })
+        assert detached["status"] == "nohup", detached
+        assert detached["nohup"]["estimated_completion_at"], detached
+        assert detached["nohup"]["next_query_at"], detached
+        detached_done = finish(proc, 5, detached["job_id"])
+        assert detached_done["status"] == "completed", detached_done
+
+        reviewed = call(proc, 6, "run_and_wait", {
             "command": [sys.executable, str(ROOT / "stalled_experiment.py"), "error"],
             "progress": {"total_steps": 4, "sample_steps": 1, "sample_timeout_sec": 1, "review_interval_sec": 1},
         })
         assert reviewed["status"] == "review_required", reviewed
         assert reviewed["review"]["classification"] == "possible_failure", reviewed
         assert "pickling_error" in reviewed["review"]["fatal_signals"], reviewed
-        call(proc, 3, "kill", {"job_id": reviewed["job_id"]})
-        killed = call(proc, 4, "wait", {"job_ids": [reviewed["job_id"]]})[0]
+        call(proc, 7, "kill", {"job_id": reviewed["job_id"]})
+        killed = call(proc, 8, "wait", {"job_ids": [reviewed["job_id"]]})[0]
         assert killed["status"] == "killed", killed
-        print(json.dumps({"completed": completed["progress"], "recovered": recovered["status"], "review": reviewed["status"], "killed": killed["status"]}))
+        print(json.dumps({"completed": completed["progress"], "recovered": recovered["status"], "nohup": detached["status"], "review": reviewed["status"], "killed": killed["status"]}))
     finally:
         proc.terminate()
         proc.wait(timeout=5)

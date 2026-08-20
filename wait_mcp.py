@@ -27,6 +27,7 @@ MAX_OUTPUT_BYTES = 1024 * 1024
 DEFAULT_PROGRESS_PATTERN = r"(?i)\b(?:epoch|step|round|iteration|iter)\s*[=:]?\s*(\d+)\s*(?:/|of)\s*(\d+)"
 DEFAULT_SAMPLE_TIMEOUT_SEC = 300.0
 DEFAULT_REVIEW_INTERVAL_SEC = 300.0
+DEFAULT_NOHUP_HOURS = 3.0
 ERROR_PATTERNS = {
     "traceback": re.compile(r"Traceback \(most recent call last\):", re.IGNORECASE),
     "pickling_error": re.compile(r"PicklingError|pickle\.(Pickling|Unpickling)Error", re.IGNORECASE),
@@ -42,7 +43,9 @@ SERVER_INSTRUCTIONS = (
     "or emit step/epoch/round/iteration N/M; the server will estimate timing and "
     "use the estimate as a review checkpoint, never kill solely because the estimate "
     "was exceeded. On review_required, inspect diagnostics/output, then call wait "
-    "to resume or kill only after confirming a failure."
+    "to resume or kill only after confirming a failure. If the estimate exceeds "
+    "nohup_hours (default 3), it hands off to detached execution and returns the "
+    "estimated completion and next query time."
 )
 DETACHED_COMMAND = re.compile(
     r"\b(?:nohup|start\s+/b|start-process|start-job)\b|(?<!&)\s&\s*(?:$|2?>)",
@@ -119,7 +122,7 @@ PROGRESS_SCHEMA = {"type": "object", "properties": {
     "review_interval_sec": {"type": "number", "minimum": 1, "default": DEFAULT_REVIEW_INTERVAL_SEC},
     "min_hard_timeout_sec": {"type": "number", "minimum": 1, "description": "Deprecated compatibility field; never causes automatic termination."},
 }}
-COMMON_RUN_PROPERTIES = {"command": COMMAND_SCHEMA, "cwd": {"type": "string"}, "env": {"type": "object", "additionalProperties": {"type": "string"}}, "name": {"type": "string"}, "progress": PROGRESS_SCHEMA}
+COMMON_RUN_PROPERTIES = {"command": COMMAND_SCHEMA, "cwd": {"type": "string"}, "env": {"type": "object", "additionalProperties": {"type": "string"}}, "name": {"type": "string"}, "progress": PROGRESS_SCHEMA, "nohup_hours": {"type": "number", "minimum": 0, "default": DEFAULT_NOHUP_HOURS}}
 
 
 TOOLS = [
@@ -132,7 +135,7 @@ TOOLS = [
 ]
 
 
-def make_monitor(value: Any) -> dict[str, Any] | None:
+def make_monitor(value: Any, nohup_hours: float = DEFAULT_NOHUP_HOURS) -> dict[str, Any] | None:
     if value is None:
         return None
     if not isinstance(value, dict):
@@ -162,6 +165,8 @@ def make_monitor(value: Any) -> dict[str, Any] | None:
         "sample_steps": min(sample_steps, total) if sample_steps and total else sample_steps,
         "sample_timeout_sec": sample_timeout,
         "review_interval_sec": review_interval,
+        "nohup_hours": nohup_hours,
+        "launcher": "windows_detached" if os.name == "nt" else "nohup",
         "current_step": 0,
         "observed_total_steps": total,
         "sampled": False,
@@ -176,6 +181,9 @@ def make_monitor(value: Any) -> dict[str, Any] | None:
         "review_required": False,
         "review_id": 0,
         "diagnostics": None,
+        "handoff_pending": False,
+        "handoff_sent": False,
+        "nohup": None,
     }
 
 
@@ -219,6 +227,11 @@ class JobStore:
             job["monitor"].setdefault("review_required", False)
             job["monitor"].setdefault("review_id", 0)
             job["monitor"].setdefault("diagnostics", None)
+            job["monitor"].setdefault("nohup_hours", DEFAULT_NOHUP_HOURS)
+            job["monitor"].setdefault("launcher", "windows_detached" if os.name == "nt" else "nohup")
+            job["monitor"].setdefault("handoff_pending", False)
+            job["monitor"].setdefault("handoff_sent", False)
+            job["monitor"].setdefault("nohup", None)
         return job
 
     def save(self, job: dict[str, Any]) -> None:
@@ -280,6 +293,9 @@ class JobStore:
             offset, changed = self.ingest_progress(job, offset)
             if changed:
                 self.save(job)
+                if monitor.get("handoff_pending"):
+                    with self.done:
+                        self.done.notify_all()
             current_time = now()
             if not monitor.get("sampled"):
                 sample_deadline = job["start_time"] + monitor["sample_timeout_sec"]
@@ -320,11 +336,19 @@ class JobStore:
             if not isinstance(args["env"], dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in args["env"].items()):
                 raise ValueError("env must be an object of string values")
             env.update(args["env"])
-        monitor = make_monitor(args.get("progress"))
+        try:
+            nohup_hours = float(args.get("nohup_hours", DEFAULT_NOHUP_HOURS))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("nohup_hours must be a non-negative number") from exc
+        if not math.isfinite(nohup_hours) or nohup_hours < 0:
+            raise ValueError("nohup_hours must be a non-negative number")
+        monitor = make_monitor(args.get("progress"), nohup_hours)
         job_id = "job-" + uuid.uuid4().hex[:12]
         stdout_path, stderr_path = str(LOGS / f"{job_id}.stdout.log"), str(LOGS / f"{job_id}.stderr.log")
         out, err = open(stdout_path, "ab", buffering=0), open(stderr_path, "ab", buffering=0)
         flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
+        if monitor and os.name == "nt":
+            flags |= getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
         start_time = now()
         try:
             proc = subprocess.Popen(command, cwd=cwd, env=env, stdout=out, stderr=err, stdin=subprocess.DEVNULL,
@@ -406,6 +430,7 @@ class JobStore:
                     estimated_duration_sec=estimate,
                     checkpoint_at=job["start_time"] + estimate,
                 )
+                changed = self.maybe_handoff(job) or changed
         return offset, changed
 
     def diagnose(self, job: dict[str, Any]) -> dict[str, Any]:
@@ -424,6 +449,31 @@ class JobStore:
             "stdout_tail": stdout_tail,
             "stderr_tail": stderr_tail,
         }
+
+    @staticmethod
+    def maybe_handoff(job: dict[str, Any]) -> bool:
+        monitor = job["monitor"]
+        estimate = monitor.get("estimated_duration_sec")
+        if monitor.get("handoff_sent") or estimate is None or estimate <= monitor["nohup_hours"] * 3600:
+            return False
+        now_ts = now()
+        completion_at = job["start_time"] + estimate
+        remaining = max(completion_at - now_ts, monitor["review_interval_sec"])
+        # ponytail: cap the next query at 1h; use a scheduler policy if job fleets need finer control.
+        next_query = now_ts + min(max(monitor["review_interval_sec"], remaining * 0.25), 3600.0)
+        monitor.update(
+            handoff_sent=True,
+            handoff_pending=True,
+            checkpoint_at=next_query,
+            nohup={
+                "launcher": monitor["launcher"],
+                "nohup_hours": monitor["nohup_hours"],
+                "estimated_duration_sec": estimate,
+                "estimated_completion_at": completion_at,
+                "next_query_at": next_query,
+            },
+        )
+        return True
 
     def review_monitor(self, job: dict[str, Any]) -> None:
         monitor = job["monitor"]
@@ -469,6 +519,9 @@ class JobStore:
             offset, changed = self.ingest_progress(job, offset)
             if changed:
                 self.save(job)
+                if monitor.get("handoff_pending"):
+                    with self.done:
+                        self.done.notify_all()
             if proc.poll() is not None:
                 return
             current_time = now()
@@ -523,6 +576,14 @@ class JobStore:
                 if cancelled and cancelled.is_set():
                     raise RequestCancelled("wait request cancelled")
                 current = [self.row(job["job_id"]) or job for job in jobs]
+                handoffs = [job for job in current if (job.get("monitor") or {}).get("handoff_pending")]
+                if handoffs:
+                    result = [self.public(job) for job in handoffs]
+                    for job in handoffs:
+                        target = self.jobs.get(job["job_id"]) or job
+                        target["monitor"]["handoff_pending"] = False
+                        self.save(target)
+                    return result
                 reviews = [job for job in current if (job.get("monitor") or {}).get("review_required")]
                 if reviews:
                     return [self.public(job) for job in reviews]
@@ -610,6 +671,13 @@ class JobStore:
             result["duration_sec"] = round(job["end_time"] - job["start_time"], 3)
         monitor = job.get("monitor") or {}
         if monitor:
+            if monitor.get("handoff_pending"):
+                result["status"] = "nohup"
+                result["nohup"] = {
+                    **(monitor.get("nohup") or {}),
+                    "estimated_completion_at": iso((monitor.get("nohup") or {}).get("estimated_completion_at")),
+                    "next_query_at": iso((monitor.get("nohup") or {}).get("next_query_at")),
+                }
             if monitor.get("review_required"):
                 result["status"] = "review_required"
                 result["review"] = monitor.get("diagnostics")
@@ -624,6 +692,8 @@ class JobStore:
                 "checkpoint_at": iso(monitor.get("checkpoint_at")),
                 "review_required": bool(monitor.get("review_required")),
                 "review_id": monitor.get("review_id", 0),
+                "nohup_hours": monitor.get("nohup_hours", DEFAULT_NOHUP_HOURS),
+                "handoff_sent": bool(monitor.get("handoff_sent")),
                 "last_progress_at": iso(monitor.get("last_progress_at")),
             }
         result["stdout_tail"], result["stderr_tail"] = tail(job.get("stdout_path", "")), tail(job.get("stderr_path", ""))
