@@ -263,6 +263,6 @@ Pass `progress` for experiments that report progress, for example:
 {"total_steps": 500, "sample_steps": 10}
 ```
 
-The server samples the flushed stdout progress, estimates average step time and total duration, checks at the predicted finish time, and terminates the job at a bounded hard deadline. The default pattern recognizes `step`, `epoch`, `round`, `iteration`, and `iter` output such as `step=10/500`; `total_steps` may be omitted when the output contains `/total`.
+The server samples the flushed stdout progress, estimates average step time and total duration, and checks output at the predicted finish time. It never terminates a healthy job merely because the estimate was exceeded: it returns `review_required` with stdout/stderr diagnostics, and the caller can resume with `wait` or terminate with `kill` after confirming a failure. The default pattern recognizes `step`, `epoch`, `round`, `iteration`, and `iter` output such as `step=10/500`; `total_steps` may be omitted when the output contains `/total`.
 
-The result exposes `progress.estimated_duration_sec`, `progress.avg_step_sec`, `progress.checkpoint_at`, and `progress.hard_deadline`. A bounded overrun returns `timed_out` instead of waiting indefinitely.
+The result exposes `progress.estimated_duration_sec`, `progress.avg_step_sec`, `progress.checkpoint_at`, and `review.fatal_signals`. A slow but healthy run remains alive; only an explicit `kill` or a real process exit ends it.

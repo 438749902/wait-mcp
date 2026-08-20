@@ -26,7 +26,13 @@ TAIL_LINES = 20
 MAX_OUTPUT_BYTES = 1024 * 1024
 DEFAULT_PROGRESS_PATTERN = r"(?i)\b(?:epoch|step|round|iteration|iter)\s*[=:]?\s*(\d+)\s*(?:/|of)\s*(\d+)"
 DEFAULT_SAMPLE_TIMEOUT_SEC = 300.0
-DEFAULT_MIN_HARD_TIMEOUT_SEC = 600.0
+DEFAULT_REVIEW_INTERVAL_SEC = 300.0
+ERROR_PATTERNS = {
+    "traceback": re.compile(r"Traceback \(most recent call last\):", re.IGNORECASE),
+    "pickling_error": re.compile(r"PicklingError|pickle\.(Pickling|Unpickling)Error", re.IGNORECASE),
+    "cuda_error": re.compile(r"CUDA out of memory|CUDA error|CUBLAS_STATUS|device-side assert", re.IGNORECASE),
+    "runtime_error": re.compile(r"(?:^|\b)(?:RuntimeError|Fatal|OOMKilled|OutOfMemoryError|No space left)(?:\b|:)", re.IGNORECASE),
+}
 SERVER_INSTRUCTIONS = (
     "For any long-running training or experiment, call run_and_wait instead of shell. "
     "It starts the job and blocks until completion in this MCP call. Use run only for "
@@ -34,7 +40,9 @@ SERVER_INSTRUCTIONS = (
     "launch experiments with nohup, shell background &, Start-Process, or detached "
     "redirection. For step-based experiments, pass progress.total_steps when known "
     "or emit step/epoch/round/iteration N/M; the server will estimate timing and "
-    "apply a bounded hard deadline."
+    "use the estimate as a review checkpoint, never kill solely because the estimate "
+    "was exceeded. On review_required, inspect diagnostics/output, then call wait "
+    "to resume or kill only after confirming a failure."
 )
 DETACHED_COMMAND = re.compile(
     r"\b(?:nohup|start\s+/b|start-process|start-job)\b|(?<!&)\s&\s*(?:$|2?>)",
@@ -108,7 +116,8 @@ PROGRESS_SCHEMA = {"type": "object", "properties": {
     "sample_steps": {"type": "integer", "minimum": 1},
     "pattern": {"type": "string", "description": "Regex with current step in group 1 and optional total in group 2."},
     "sample_timeout_sec": {"type": "number", "minimum": 1, "default": DEFAULT_SAMPLE_TIMEOUT_SEC},
-    "min_hard_timeout_sec": {"type": "number", "minimum": 1, "default": DEFAULT_MIN_HARD_TIMEOUT_SEC},
+    "review_interval_sec": {"type": "number", "minimum": 1, "default": DEFAULT_REVIEW_INTERVAL_SEC},
+    "min_hard_timeout_sec": {"type": "number", "minimum": 1, "description": "Deprecated compatibility field; never causes automatic termination."},
 }}
 COMMON_RUN_PROPERTIES = {"command": COMMAND_SCHEMA, "cwd": {"type": "string"}, "env": {"type": "object", "additionalProperties": {"type": "string"}}, "name": {"type": "string"}, "progress": PROGRESS_SCHEMA}
 
@@ -146,13 +155,13 @@ def make_monitor(value: Any) -> dict[str, Any] | None:
     if sample_steps is None and total is not None:
         sample_steps = min(20, max(3, math.ceil(total * 0.02)))
     sample_timeout = max(1.0, float(value.get("sample_timeout_sec", DEFAULT_SAMPLE_TIMEOUT_SEC)))
-    min_hard_timeout = max(1.0, float(value.get("min_hard_timeout_sec", DEFAULT_MIN_HARD_TIMEOUT_SEC)))
+    review_interval = max(1.0, float(value.get("review_interval_sec", DEFAULT_REVIEW_INTERVAL_SEC)))
     return {
         "pattern": pattern,
         "total_steps": total,
         "sample_steps": min(sample_steps, total) if sample_steps and total else sample_steps,
         "sample_timeout_sec": sample_timeout,
-        "min_hard_timeout_sec": min_hard_timeout,
+        "review_interval_sec": review_interval,
         "current_step": 0,
         "observed_total_steps": total,
         "sampled": False,
@@ -164,6 +173,9 @@ def make_monitor(value: Any) -> dict[str, Any] | None:
         "last_progress_at": None,
         "sample_step": None,
         "sample_time": None,
+        "review_required": False,
+        "review_id": 0,
+        "diagnostics": None,
     }
 
 
@@ -202,6 +214,11 @@ class JobStore:
             job["monitor"] = json.loads(raw or "{}")
         except (TypeError, json.JSONDecodeError):
             job["monitor"] = {}
+        if job["monitor"]:
+            job["monitor"].setdefault("review_interval_sec", DEFAULT_REVIEW_INTERVAL_SEC)
+            job["monitor"].setdefault("review_required", False)
+            job["monitor"].setdefault("review_id", 0)
+            job["monitor"].setdefault("diagnostics", None)
         return job
 
     def save(self, job: dict[str, Any]) -> None:
@@ -267,25 +284,18 @@ class JobStore:
             if not monitor.get("sampled"):
                 sample_deadline = job["start_time"] + monitor["sample_timeout_sec"]
                 if current_time >= sample_deadline:
-                    monitor.update(
-                        sampled=True,
-                        estimated_duration_sec=monitor["sample_timeout_sec"],
-                        checkpoint_at=sample_deadline,
-                        hard_deadline=job["start_time"] + max(monitor["sample_timeout_sec"] * 2, monitor["min_hard_timeout_sec"]),
-                    )
+                    monitor.update(sampled=True, estimated_duration_sec=monitor["sample_timeout_sec"], checkpoint_at=sample_deadline)
                     self.save(job)
                 else:
                     time.sleep(min(1.0, sample_deadline - current_time))
                     continue
-            target = monitor["hard_deadline"] if monitor.get("checkpointed") else monitor["checkpoint_at"]
+            target = monitor["checkpoint_at"]
             if target - now() <= 0:
-                if not monitor.get("checkpointed"):
-                    self.checkpoint_monitor(job)
-                    self.save(job)
-                    continue
-                job["timeout_requested"] = True
-                self.kill({"job_id": job["job_id"], "timeout_sec": 1})
-                break
+                self.review_monitor(job)
+                self.save(job)
+                while monitor.get("review_required") and pid_alive(job["pid"]):
+                    time.sleep(1)
+                continue
             time.sleep(min(1.0, target - now()))
         code = recovered_exit_code(job["pid"])
         status = "timed_out" if job.get("timeout_requested") else ("completed" if code == 0 else "failed")
@@ -395,9 +405,46 @@ class JobStore:
                     avg_step_sec=average,
                     estimated_duration_sec=estimate,
                     checkpoint_at=job["start_time"] + estimate,
-                    hard_deadline=job["start_time"] + max(estimate * 2, monitor["min_hard_timeout_sec"]),
                 )
         return offset, changed
+
+    def diagnose(self, job: dict[str, Any]) -> dict[str, Any]:
+        stdout_tail, stderr_tail = tail(job["stdout_path"], 50), tail(job["stderr_path"], 50)
+        signals = []
+        for name, pattern in ERROR_PATTERNS.items():
+            if pattern.search("\n".join(stdout_tail + stderr_tail)):
+                signals.append(name)
+        monitor = job["monitor"]
+        return {
+            "at": iso(now()),
+            "classification": "possible_failure" if signals else "still_running",
+            "fatal_signals": signals,
+            "current_step": monitor.get("current_step", 0),
+            "total_steps": monitor.get("observed_total_steps"),
+            "stdout_tail": stdout_tail,
+            "stderr_tail": stderr_tail,
+        }
+
+    def review_monitor(self, job: dict[str, Any]) -> None:
+        monitor = job["monitor"]
+        self.checkpoint_monitor(job)
+        current, total, average = monitor.get("current_step", 0), monitor.get("observed_total_steps"), monitor.get("avg_step_sec")
+        remaining = (total - current) * average if total and average and current < total else 0
+        monitor.update(
+            review_required=True,
+            review_id=monitor.get("review_id", 0) + 1,
+            diagnostics=self.diagnose(job),
+            checkpoint_at=now() + max(remaining, monitor["review_interval_sec"]),
+        )
+
+    @staticmethod
+    def acknowledge_review(job: dict[str, Any]) -> bool:
+        monitor = job.get("monitor") or {}
+        if not monitor.get("review_required"):
+            return False
+        monitor["review_required"] = False
+        monitor["checkpointed"] = False
+        return True
 
     @staticmethod
     def checkpoint_monitor(job: dict[str, Any]) -> None:
@@ -428,12 +475,7 @@ class JobStore:
             if not monitor.get("sampled"):
                 sample_deadline = job["start_time"] + monitor["sample_timeout_sec"]
                 if current_time >= sample_deadline:
-                    monitor.update(
-                        sampled=True,
-                        estimated_duration_sec=monitor["sample_timeout_sec"],
-                        checkpoint_at=sample_deadline,
-                        hard_deadline=job["start_time"] + max(monitor["sample_timeout_sec"] * 2, monitor["min_hard_timeout_sec"]),
-                    )
+                    monitor.update(sampled=True, estimated_duration_sec=monitor["sample_timeout_sec"], checkpoint_at=sample_deadline)
                     self.save(job)
                     continue
                 try:
@@ -441,22 +483,22 @@ class JobStore:
                 except subprocess.TimeoutExpired:
                     pass
                 continue
-            target = monitor["hard_deadline"] if monitor.get("checkpointed") else monitor["checkpoint_at"]
+            target = monitor["checkpoint_at"]
             remaining = target - now()
             if remaining <= 0:
-                if not monitor.get("checkpointed"):
-                    self.checkpoint_monitor(job)
-                    self.save(job)
-                    continue
-                job["timeout_requested"] = True
-                self.kill({"job_id": job_id, "timeout_sec": 1})
-                return
+                self.review_monitor(job)
+                self.save(job)
+                with self.done:
+                    self.done.notify_all()
+                    while monitor.get("review_required") and proc.poll() is None:
+                        self.done.wait()
+                continue
             try:
                 proc.wait(timeout=remaining)
             except subprocess.TimeoutExpired:
                 pass
 
-    def wait(self, ids: list[str] | None, mode: str, cancelled: threading.Event | None = None) -> list[dict[str, Any]]:
+    def wait(self, ids: list[str] | None, mode: str, cancelled: threading.Event | None = None, resume: bool = True) -> list[dict[str, Any]]:
         if mode not in ("all", "any"):
             raise ValueError("mode must be all or any")
         if ids is None:
@@ -469,11 +511,21 @@ class JobStore:
             if not job:
                 raise ValueError(f"unknown job_id: {job_id}")
             jobs.append(job)
+        if resume:
+            changed = any(self.acknowledge_review(job) for job in jobs)
+            if changed:
+                for job in jobs:
+                    self.save(job)
+                with self.done:
+                    self.done.notify_all()
         with self.done:
             while True:
                 if cancelled and cancelled.is_set():
                     raise RequestCancelled("wait request cancelled")
                 current = [self.row(job["job_id"]) or job for job in jobs]
+                reviews = [job for job in current if (job.get("monitor") or {}).get("review_required")]
+                if reviews:
+                    return [self.public(job) for job in reviews]
                 finished = [job for job in current if job.get("status") != "running"]
                 if (mode == "all" and len(finished) == len(current)) or (mode == "any" and finished):
                     result = finished if mode == "any" else current
@@ -558,6 +610,9 @@ class JobStore:
             result["duration_sec"] = round(job["end_time"] - job["start_time"], 3)
         monitor = job.get("monitor") or {}
         if monitor:
+            if monitor.get("review_required"):
+                result["status"] = "review_required"
+                result["review"] = monitor.get("diagnostics")
             result["progress"] = {
                 "current_step": monitor.get("current_step", 0),
                 "total_steps": monitor.get("observed_total_steps"),
@@ -567,7 +622,8 @@ class JobStore:
                 "estimated_duration_sec": monitor.get("estimated_duration_sec"),
                 "avg_step_sec": monitor.get("avg_step_sec"),
                 "checkpoint_at": iso(monitor.get("checkpoint_at")),
-                "hard_deadline": iso(monitor.get("hard_deadline")),
+                "review_required": bool(monitor.get("review_required")),
+                "review_id": monitor.get("review_id", 0),
                 "last_progress_at": iso(monitor.get("last_progress_at")),
             }
         result["stdout_tail"], result["stderr_tail"] = tail(job.get("stdout_path", "")), tail(job.get("stderr_path", ""))
@@ -577,9 +633,9 @@ class JobStore:
 def call(store: JobStore, name: str, args: dict[str, Any], cancelled: threading.Event | None = None) -> Any:
     if name == "run_and_wait":
         started = store.run(args)
-        return store.wait([started["job_id"]], "all", cancelled)[0]
+        return store.wait([started["job_id"]], "all", cancelled, resume=False)[0]
     if name == "run": return store.run(args)
-    if name == "wait": return store.wait(args.get("job_ids"), args.get("mode", "all"), cancelled)
+    if name == "wait": return store.wait(args.get("job_ids"), args.get("mode", "all"), cancelled, resume=True)
     if name == "output": return store.output(args)
     if name == "kill": return store.kill(args)
     if name == "list": return [store.public(j) for j in store.jobs_for(args.get("status"), args.get("cwd"))]
