@@ -38,8 +38,9 @@ SERVER_INSTRUCTIONS = (
     "For any long-running training or experiment, call run_and_wait instead of shell. "
     "It starts the job and blocks until completion in this MCP call. Use run only for "
     "explicit concurrency, then call wait immediately before doing other work. Never "
-    "launch experiments with nohup, shell background &, Start-Process, or detached "
-    "redirection. For step-based experiments, pass progress.total_steps when known "
+    "launch experiments with bare nohup, shell background &, Start-Process, or detached "
+    "redirection by default. If the user explicitly requests manual nohup, set "
+    "allow_manual_nohup=true for the MCP call. For step-based experiments, pass progress.total_steps when known "
     "or emit step/epoch/round/iteration N/M; the server will estimate timing and "
     "use the estimate as a review checkpoint, never kill solely because the estimate "
     "was exceeded. On review_required, inspect diagnostics/output, then call wait "
@@ -51,6 +52,8 @@ DETACHED_COMMAND = re.compile(
     r"\b(?:nohup|start\s+/b|start-process|start-job)\b|(?<!&)\s&\s*(?:$|2?>)",
     re.IGNORECASE,
 )
+NOHUP_COMMAND = re.compile(r"\bnohup\b", re.IGNORECASE)
+OTHER_DETACHED_COMMAND = re.compile(r"\b(?:start\s+/b|start-process|start-job)\b", re.IGNORECASE)
 
 
 class RequestCancelled(Exception):
@@ -122,7 +125,7 @@ PROGRESS_SCHEMA = {"type": "object", "properties": {
     "review_interval_sec": {"type": "number", "minimum": 1, "default": DEFAULT_REVIEW_INTERVAL_SEC},
     "min_hard_timeout_sec": {"type": "number", "minimum": 1, "description": "Deprecated compatibility field; never causes automatic termination."},
 }}
-COMMON_RUN_PROPERTIES = {"command": COMMAND_SCHEMA, "cwd": {"type": "string"}, "env": {"type": "object", "additionalProperties": {"type": "string"}}, "name": {"type": "string"}, "progress": PROGRESS_SCHEMA, "nohup_hours": {"type": "number", "minimum": 0, "default": DEFAULT_NOHUP_HOURS}}
+COMMON_RUN_PROPERTIES = {"command": COMMAND_SCHEMA, "cwd": {"type": "string"}, "env": {"type": "object", "additionalProperties": {"type": "string"}}, "name": {"type": "string"}, "progress": PROGRESS_SCHEMA, "nohup_hours": {"type": "number", "minimum": 0, "default": DEFAULT_NOHUP_HOURS}, "allow_manual_nohup": {"type": "boolean", "default": False, "description": "Set true only when the user explicitly requested a manual nohup launch."}}
 
 
 TOOLS = [
@@ -326,8 +329,12 @@ class JobStore:
         if not isinstance(command, (str, list)) or (isinstance(command, list) and not all(isinstance(x, str) for x in command)):
             raise ValueError("command must be a string or string array")
         command_text = command if isinstance(command, str) else " ".join(command)
-        if DETACHED_COMMAND.search(command_text):
-            raise ValueError("detached experiment launch is not supported; use run_and_wait or run followed by wait")
+        allow_manual_nohup = args.get("allow_manual_nohup", False)
+        if not isinstance(allow_manual_nohup, bool):
+            raise ValueError("allow_manual_nohup must be a boolean")
+        manual_nohup = allow_manual_nohup and NOHUP_COMMAND.search(command_text) and not OTHER_DETACHED_COMMAND.search(command_text)
+        if DETACHED_COMMAND.search(command_text) and not manual_nohup:
+            raise ValueError("detached experiment launch is not supported by default; set allow_manual_nohup=true only when the user explicitly requested nohup")
         cwd = str(Path(args.get("cwd") or os.getcwd()).expanduser().resolve())
         if not Path(cwd).is_dir():
             raise ValueError(f"cwd does not exist: {cwd}")

@@ -14,6 +14,7 @@
 - 自适应耗时估计：根据早期进度计算平均步时和预计完成时间。
 - 安全检查点：预计时间到达后先分析 stdout/stderr，健康任务不会被硬超时误杀；异常时返回 `review_required`。
 - 长任务交接：预计时长超过 `nohup_hours`（默认 3 小时）时返回 `status: "nohup"`、预计完成时间和下次建议查询时间，任务继续运行。
+- 默认禁止裸用 `nohup`；用户明确要求时，MCP 设置 `allow_manual_nohup: true`，Shell 命令追加 `# wait-mcp: user-nohup`。其他脱离式启动仍被禁止。
 
 Windows 使用原生 detached 进程实现上述后台交接；Linux/macOS 使用 nohup 风格的独立会话。
 
@@ -58,6 +59,14 @@ tool_timeout_sec = 86400
 
 没有可识别的进度输出时，服务端不会伪造耗时估计，也不会自动交接。
 
+用户明确指定手动 `nohup` 时，MCP 调用示例：
+
+```json
+{"command": "nohup python train.py > train.log 2>&1 &", "allow_manual_nohup": true}
+```
+
+通过 Shell hook 时，在命令末尾追加 `# wait-mcp: user-nohup`；没有该标记的裸 `nohup` 仍会被拦截。
+
 ## 工具
 
 | 工具 | 用途 |
@@ -75,6 +84,7 @@ tool_timeout_sec = 86400
 python self_test.py
 python control_test.py
 python list_test.py
+python policy_test.py
 python adaptive_progress_test.py
 python acceptance.py
 python acceptance_multi.py

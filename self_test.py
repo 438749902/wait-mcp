@@ -31,6 +31,10 @@ def main():
     assert "run_and_wait" in {tool["name"] for tool in tools["result"]["tools"]}
     blocked = send(proc, {"jsonrpc": "2.0", "id": 1.75, "method": "tools/call", "params": {"name": "run", "arguments": {"command": "nohup python train.py"}}})
     assert "detached experiment launch" in blocked["error"]["message"]
+    manual = call(proc, 1.8, "run", {"command": f'nohup "{sys.executable}" -c "print(1)"', "allow_manual_nohup": True})
+    assert manual["status"] in ("running", "completed", "failed"), manual
+    if manual["status"] == "running":
+        assert call(proc, 1.9, "wait", {"job_ids": [manual["job_id"]]})[0]["status"] in ("completed", "failed")
     one = call(proc, 2, "run", {"command": [sys.executable, str(ROOT / "dummy_experiment.py"), "2"], "name": "two-second"})
     assert one["status"] == "running"
     current = call(proc, 3, "output", {"job_id": one["job_id"], "tail_lines": 1})

@@ -14,6 +14,7 @@ A Windows-first, stdlib-only MCP server for long-running local shell jobs. Waiti
 - Adaptive runtime estimates based on early progress samples.
 - Review checkpoints that inspect output before stopping a slow job; healthy jobs are never killed by a hard timeout.
 - Long-job handoff through `nohup_hours` (default: 3 hours). If the estimate exceeds the threshold, the call returns `status: "nohup"`, an estimated completion time, and a suggested next query time while the job keeps running.
+- Bare `nohup` is blocked by default. When the user explicitly requests it, set `allow_manual_nohup: true` for MCP or append `# wait-mcp: user-nohup` to a shell command; other detached launchers remain blocked.
 
 On Windows the handoff uses a native detached process. On Linux/macOS it uses a nohup-style independent session.
 
@@ -58,6 +59,14 @@ Make the job flush progress lines such as `step=10/500`, `epoch=2/20`, or `itera
 
 Without recognizable progress output, the server does not invent a runtime estimate or perform an automatic handoff.
 
+Example of an explicitly authorized manual `nohup` MCP call:
+
+```json
+{"command": "nohup python train.py > train.log 2>&1 &", "allow_manual_nohup": true}
+```
+
+For the shell hook, append `# wait-mcp: user-nohup`. A bare `nohup` without that marker remains blocked.
+
 ## Tools
 
 | Tool | Purpose |
@@ -75,6 +84,7 @@ Without recognizable progress output, the server does not invent a runtime estim
 python self_test.py
 python control_test.py
 python list_test.py
+python policy_test.py
 python adaptive_progress_test.py
 python acceptance.py
 python acceptance_multi.py
